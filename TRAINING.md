@@ -59,7 +59,7 @@ the simulator. Entire episodes stay in one split. The manifest records source
 revision, variant, scores, wins, and row counts. Existing output directories
 are never overwritten.
 
-Use the [post-training research package](https://github.com/Metta-AI/posttraining-research/tree/main/packages/metta-posttraining)
+Use the [post-training research package](https://github.com/softmax-universe/posttraining-research/tree/main/packages/metta-posttraining)
 for current training and adapter-packaging workflows.
 
 

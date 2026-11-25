@@ -15,46 +15,67 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-class Provider(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+def make_provider(fail_beat=None):
+    calls = []
 
-    def log_message(self, *args):
-        pass
+    class Provider(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
 
-    def do_POST(self):
-        raw = self.rfile.read(int(self.headers["Content-Length"]))
-        body = json.loads(raw)
-        user = body["messages"][0]["content"]
-        beat = int(re.search(r"BEAT (\d+)", user)[1])
-        slot = self.headers["X-Coworld-Player-Slot"]
-        assert "PRIVATE_OPERATOR_" + slot in user
-        assert "PRIVATE_OPERATOR_" + str(1 - int(slot)) not in user
-        retry = "Your previous reply was invalid" in user
-        if beat == 2 or (beat == 1 and not retry):
-            text = "invalid fixture reply"
-        else:
-            action = {"intent": "take_mine", "say": "", "notes": "PRIVATE_CAPTURE_" + slot}
-            if beat == 3:
-                action.update(notes="x" * 900, say="s" * 100)
-            text = json.dumps(action)
-        response = json.dumps(
-            {
-                "model": body["model"],
-                "stop_reason": "end_turn",
-                "content": [{"type": "text", "text": text}],
-                "usage": None if beat == 4 else {"input_tokens": 100, "output_tokens": 20},
-            }
-        ).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(response)))
-        self.send_header("X-Softmax-Llm-Call-Id", str(uuid.uuid5(uuid.NAMESPACE_URL, raw.decode())))
-        self.end_headers()
-        self.wfile.write(response)
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers["Content-Length"]))
+            body = json.loads(raw)
+            user = body["messages"][0]["content"]
+            beat = int(re.search(r"BEAT (\d+)", user)[1])
+            slot = self.headers["X-Coworld-Player-Slot"]
+            calls.append((beat, int(slot)))
+            assert "PRIVATE_OPERATOR_" + slot in user
+            assert "PRIVATE_OPERATOR_" + str(1 - int(slot)) not in user
+            retry = "Your previous reply was invalid" in user
+            if (fail_beat is not None and beat == fail_beat) or (beat == 1 and not retry):
+                text = "invalid fixture reply"
+            else:
+                action = {"intent": "take_mine", "say": "", "notes": "PRIVATE_CAPTURE_" + slot}
+                if beat == 2:
+                    action["intent"] = "guard"
+                    text = "```json\n" + json.dumps(action) + "\n```"
+                else:
+                    if beat == 3:
+                        action.update(notes="x" * 900, say="s" * 100)
+                    text = json.dumps(action)
+            response = json.dumps(
+                {
+                    "model": body["model"],
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": text}],
+                    "usage": None if beat == 4 else {"input_tokens": 100, "output_tokens": 20},
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.send_header("X-Softmax-Llm-Call-Id", str(uuid.uuid5(uuid.NAMESPACE_URL, raw.decode())))
+            self.end_headers()
+            self.wfile.write(response)
+
+    return Provider, calls
 
 
-def run(game, player, output, variant, capture, model_enabled=True):
-    root = output / f"{variant['id']}-capture{capture}{'' if model_enabled else '-offline'}"
+def run(
+    game,
+    player,
+    output,
+    variant,
+    capture,
+    model_enabled=True,
+    fail_beat=None,
+    seat1_scripted=None,
+    label="",
+):
+    suffix = label or f"{variant['id']}-capture{capture}{'' if model_enabled else '-offline'}"
+    root = output / suffix
     root.mkdir(mode=0o700)
     config = dict(variant["game_config"])
     seats = config["num_agents"]
@@ -81,13 +102,14 @@ def run(game, player, output, variant, capture, model_enabled=True):
         "AWS_BEARER_TOKEN_BEDROCK",
     ):
         env.pop(key, None)
-    episode = f"coins-native-capture-fixture-{variant['id']}"
+    episode = f"coins-native-capture-fixture-{suffix}"
     env.update(
         COGAME_HOST="127.0.0.1",
         COGAME_PORT=str(port),
         COGAME_CONFIG_URI=(root / "config.json").as_uri(),
         COGAME_RESULTS_URI=(root / "results.json").as_uri(),
         COGAME_SAVE_REPLAY_URI=(root / "replay.json").as_uri(),
+        COGAME_PLAYER_FAILURE_URI=(root / "player_failure.json").as_uri(),
         COGAME_SAVE_TRAJECTORY_URI=(root / "trajectory.jsonl").as_uri(),
         COWORLD_EPISODE_ID=episode,
         COWORLD_GAME_VERSION="identity-fixture",
@@ -95,7 +117,8 @@ def run(game, player, output, variant, capture, model_enabled=True):
     )
     if not capture:
         env.pop("COGAME_SAVE_TRAJECTORY_URI")
-    provider = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    provider_cls, calls = make_provider(fail_beat=fail_beat)
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), provider_cls)
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
     if model_enabled:
@@ -121,7 +144,11 @@ def run(game, player, output, variant, capture, model_enabled=True):
         for seat in range(seats):
             log = (root / f"player-{seat}.log").open("wb")
             streams.append(log)
-            player_env = dict(env, PLAYER_PROMPT=f"PRIVATE_OPERATOR_{seat}", COWORLD_TIMEOUT_SECONDS="120")
+            player_env = dict(env, COWORLD_TIMEOUT_SECONDS="120")
+            if seat == 1 and seat1_scripted:
+                player_env["PLAYER_SCRIPTED"] = seat1_scripted
+            else:
+                player_env["PLAYER_PROMPT"] = f"PRIVATE_OPERATOR_{seat}"
             player_env["COWORLD_PLAYER_WS_URL"] = f"ws://127.0.0.1:{port}/player?slot={seat}&token=fixture-{seat}"
             children.append(subprocess.Popen([str(player)], env=player_env, stdout=log, stderr=subprocess.STDOUT))
         assert server.wait(timeout=120) == 0
@@ -129,9 +156,54 @@ def run(game, player, output, variant, capture, model_enabled=True):
             assert child.wait(timeout=5) == 0
         results = json.loads((root / "results.json").read_text())
         replay = json.loads((root / "replay.json").read_text())
+        failure_path = root / "player_failure.json"
+
+        expect_failure = (not model_enabled) or (fail_beat is not None)
+        if expect_failure:
+            assert failure_path.exists(), "expected explicit player failure"
+            failure = json.loads(failure_path.read_text())
+            assert failure["failed_policy_index"] == 0
+            assert results["reason"] == "forfeit"
+            if capture:
+                trace = root / "trajectory.jsonl"
+                rows = [json.loads(line) for line in trace.read_text().splitlines()]
+                assert trace.stat().st_mode & 0o077 == 0
+                assert rows[-1]["status"] == "failed"
+                assert rows[-1]["outcome"] == results
+                failed_row = rows[-2]
+                assert failed_row["action_status"] == "rejected"
+                assert failed_row["selected_attempt_id"] is None
+                assert failed_row["executed_action"] is None
+                assert failed_row["terminal"] is True
+                if not model_enabled:
+                    assert len(failed_row["attempts"]) == 1
+                    assert failed_row["attempts"][0]["rejection_reason"] is not None
+                else:
+                    assert len(failed_row["attempts"]) == 2
+                    for attempt in failed_row["attempts"]:
+                        assert not attempt["accepted"]
+                        assert "invalid fixture reply" in attempt["raw_response"]
+            for event in replay["events"]:
+                event.pop("latencyMs", None)
+            return results, replay
+
+        assert not failure_path.exists(), f"unexpected failure: {failure_path.read_text()}"
         assert results["reason"] in ("random_end", "beat_cap")
         assert config["minBeats"] <= results["beats"] <= config["maxBeats"]
-        if capture:
+        orders = [event for event in replay["events"] if event["k"] == "order"]
+        assert all(event["source"] != "fallback" for event in orders)
+
+        if seat1_scripted:
+            assert calls, "model seat must call HTTP"
+            assert all(slot == 0 for _, slot in calls), "only model seat should call HTTP"
+            seat0_orders = [e for e in orders if e["seat"] == 0]
+            seat1_orders = [e for e in orders if e["seat"] == 1]
+            assert len(seat0_orders) == results["beats"]
+            assert len(seat1_orders) == results["beats"]
+            assert seat0_orders[0]["source"] == "retry"
+            assert seat0_orders[1]["intent"] == "guard" and seat0_orders[1]["source"] == "llm"
+            assert all(e["source"] == "scripted" for e in seat1_orders)
+        elif capture:
             trace = root / "trajectory.jsonl"
             rows = [json.loads(line) for line in trace.read_text().splitlines()]
             assert trace.stat().st_mode & 0o077 == 0
@@ -139,13 +211,6 @@ def run(game, player, output, variant, capture, model_enabled=True):
             assert rows[-1]["status"] == "completed"
             assert rows[-1]["outcome"] == results
             for row in rows[:-1]:
-                if not model_enabled:
-                    assert row["action_status"] == "fallback"
-                    assert row["selected_attempt_id"] is None
-                    assert len(row["attempts"]) == 1
-                    assert row["attempts"][0]["origin"] == "unknown"
-                    assert row["attempts"][0]["platform_call_id"] is None
-                    continue
                 beat = row["observation"]["beat"]
                 attempts = row["attempts"]
                 if beat == 1:
@@ -153,8 +218,8 @@ def run(game, player, output, variant, capture, model_enabled=True):
                     assert attempts[1]["accepted"]
                     assert row["selected_attempt_id"] == attempts[1]["attempt_id"]
                 elif beat == 2:
-                    assert row["action_status"] == "fallback"
-                    assert row["selected_attempt_id"] is None and len(attempts) == 2
+                    assert row["action_status"] == "accepted"
+                    assert row["executed_action"]["intent"] == "guard"
                 elif beat == 3:
                     assert row["action_status"] == "rejected"
                     assert row["selected_attempt_id"] is None
@@ -169,14 +234,11 @@ def run(game, player, output, variant, capture, model_enabled=True):
                     assert attempt["prompt"][0]["content"] == attempt["request"]["system"]
                     assert attempt["platform_call_id"] is not None
                     assert attempt["behavior_logprobs"] is None
-            orders = [event for event in replay["events"] if event["k"] == "order"]
             assert len(orders) == len(rows) - 1
             for event, row in zip(orders, rows[:-1], strict=True):
                 assert event["beat"] == row["observation"]["beat"]
                 assert event["seat"] == int(row["seat"])
                 assert {key: event[key] for key in ("intent", "say", "notes")} == row["executed_action"]
-        # Keep received latency measurements in the raw artifacts. Physical
-        # replay parity excludes only these naturally varying wall-clock values.
         for event in replay["events"]:
             event.pop("latencyMs", None)
         return results, replay
@@ -204,12 +266,47 @@ def main():
         captured = run(game, player, destination, variant, True)
         ordinary = run(game, player, destination, variant, False)
         assert captured == ordinary, "capture changed the native outcome or replay"
-    captured = run(game, player, destination, manifest["variants"][0], True, model_enabled=False)
-    ordinary = run(game, player, destination, manifest["variants"][0], False, model_enabled=False)
-    assert captured == ordinary, "capture changed the offline fallback game"
+    run(
+        game,
+        player,
+        destination,
+        manifest["variants"][0],
+        True,
+        seat1_scripted="reciprocator",
+        label="model-vs-reciprocator",
+    )
+    run(
+        game,
+        player,
+        destination,
+        manifest["variants"][0],
+        True,
+        fail_beat=2,
+        label="exhausted-invalid-reply-fails",
+    )
+    captured = run(
+        game,
+        player,
+        destination,
+        manifest["variants"][0],
+        True,
+        model_enabled=False,
+        label="offline-no-creds-capture",
+    )
+    ordinary = run(
+        game,
+        player,
+        destination,
+        manifest["variants"][0],
+        False,
+        model_enabled=False,
+        label="offline-no-creds-ordinary",
+    )
+    assert captured == ordinary, "capture changed the offline failure outcome or replay"
     print(
-        "twelve complete native games: physical replay parity, applied-action joins, retries, fallback, "
-        "normalization, privacy, missing usage and offline no-evidence fallback pass"
+        "native games passed: physical replay parity, model-vs-baseline HTTP execution, "
+        "outer Markdown JSON fence, retries, normalization, explicit failure on invalid replies "
+        "and missing credentials"
     )
 
 

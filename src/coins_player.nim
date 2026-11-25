@@ -32,12 +32,16 @@ when isMainModule:
   if url.len == 0:
     quit("COWORLD_PLAYER_WS_URL is not set", 1)
   let llm = getEnv("PLAYER_LLM") == "1"
-  var prompt = getEnv("PLAYER_PROMPT")
-  if prompt.strip().len == 0:
-    prompt = DefaultPrompt
   let scripted = getEnv("PLAYER_SCRIPTED").strip()
   if llm and scripted.len > 0:
     quit("select one of PLAYER_LLM and PLAYER_SCRIPTED", 1)
+  if scripted.len > 0 and
+      scripted notin ["honest", "greedy", "reciprocator", "tit-for-tat"]:
+    quit("unknown PLAYER_SCRIPTED \"" & scripted &
+      "\"; expected one of honest, greedy, reciprocator, tit-for-tat", 1)
+  var prompt = getEnv("PLAYER_PROMPT")
+  if scripted.len == 0 and not llm and prompt.strip().len == 0:
+    prompt = DefaultPrompt
   var policy = getEnv("COWORLD_POLICY_NAME").strip()
   if policy.len == 0:
     policy = getEnv("PLAYER_NAME").strip()

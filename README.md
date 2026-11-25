@@ -46,10 +46,12 @@ The game sends the player's seat-private observation and accepts an ordinary
 intent action from an external player. The game validates that action and
 records `source: "external"` in the replay.
 
-Set `PLAYER_LLM=1` to use Claude with an intentionally blank `PLAYER_PROMPT`.
-Without that flag, an unset prompt supplies the built-in restraint strategy;
-a whitespace-only prompt selects the scripted fallback. The matched local
-pilot can give external policies and Claude the same empty operator guidance.
+Set `PLAYER_LLM=1` to use the LLM with an intentionally blank `PLAYER_PROMPT`.
+Without that flag and without `PLAYER_SCRIPTED`, an unset prompt supplies the
+built-in restraint strategy. To select a deterministic baseline, set
+`PLAYER_SCRIPTED=honest|greedy|reciprocator|tit-for-tat` explicitly. The game
+never falls back to a scripted baseline on failed model replies or missing
+credentials.
 
 Prompt and scripted policies retain their existing registration path. External
 policies receive a `coins.player.v2` observation frame for each beat and reply
@@ -101,8 +103,9 @@ property the ladder needs with only two seats.
 Every baseline reads the same observation object an LLM seat receives and
 **never raw sim state** — that is what makes a baseline a legitimate policy,
 and `tests/test_baseline.nim` asserts it by running each against a frozen
-observation. `reciprocator` is also the move every failure path lands on: an
-unparseable reply, a timeout, a 401, a seat that never connected.
+observation. Failed model replies, missing credentials, timeouts, and
+disconnected seats end the episode with an explicit failure rather than
+substituting a baseline move.
 
 ## Watching
 

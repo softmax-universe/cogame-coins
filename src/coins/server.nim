@@ -40,6 +40,7 @@ type
     external: seq[bool]
     decisionId: int
     pendingActions: seq[JsonNode]
+    pendingRejections: seq[string]
     policies: seq[string]
     registered: seq[bool]
     everRegistered: seq[bool]
@@ -237,9 +238,6 @@ proc runGame(cfg: RuntimeConfig) {.gcsafe.} =
         if not shared.everRegistered[slot]:
           if noShow < 0:
             noShow = slot
-          ## A seat that never connects does not end the episode: it plays
-          ## `reciprocator` for every remaining beat.
-          shared.scripted[slot] = skReciprocator
         gameSim.policyKinds[slot] =
           if shared.scripted[slot] != skNone: "scripted"
           elif shared.external[slot]: "external"
@@ -249,20 +247,23 @@ proc runGame(cfg: RuntimeConfig) {.gcsafe.} =
       echo "coins: starting with ", connectedCount, "/", shared.seats,
         " players connected"
 
-    if connectedCount == 0:
-      ## `forfeit` is reserved for the case where NEITHER seat connected.
+    if connectedCount == 0 or noShow >= 0:
+      let failedSlot = if noShow >= 0: noShow else: 0
+      let message =
+        if connectedCount == 0:
+          "no seat connected within " &
+            $config.playerConnectTimeoutSeconds & "s"
+        else:
+          "player slot " & $failedSlot & " never registered within " &
+            $config.playerConnectTimeoutSeconds & "s"
       withLock stateLock:
         for slot in 0 ..< Seats:
           gameSim.cogs[slot].score = 0
       gameSim.endEpisode(erForfeit)
-      declarePlayerFailure(0, "no seat connected within " &
-        $config.playerConnectTimeoutSeconds & "s")
+      declarePlayerFailure(failedSlot, message)
       finishEpisode()
       sleep(config.shutdownGraceSeconds * 1000)
       quit(0)
-    if noShow >= 0:
-      declarePlayerFailure(noShow, "player slot " & $noShow &
-        " never registered; the seat played the reciprocator baseline")
 
     let client = newLlmClient(config)
 
@@ -284,11 +285,10 @@ proc runGame(cfg: RuntimeConfig) {.gcsafe.} =
         for slot in 0 ..< Seats:
           if not shared.playerSockets.hasKey(slot) and
               kinds[slot] == skNone:
-            ## Disconnected mid-episode: play the reciprocator baseline for
-            ## every remaining beat. The episode never waits on it.
-            kinds[slot] = skReciprocator
-          if external[slot]:
-            kinds[slot] = skReciprocator
+            let err = newException(DecisionFailureError,
+              "player slot " & $slot & " disconnected")
+            err.slot = slot
+            raise err
       if external.anyIt(it):
         if lastExternalAt >= 0 and
             now() - lastExternalAt < config.minBeatSeconds.float:
@@ -299,6 +299,7 @@ proc runGame(cfg: RuntimeConfig) {.gcsafe.} =
         inc shared.decisionId
         decisionId = shared.decisionId
         shared.pendingActions = newSeq[JsonNode](shared.seats)
+        shared.pendingRejections = newSeq[string](shared.seats)
         for seat in seats:
           if external[seat] and shared.playerSockets.hasKey(seat):
             let observation = view.buildObservation(seat)
@@ -312,9 +313,22 @@ proc runGame(cfg: RuntimeConfig) {.gcsafe.} =
         captureViews.setLen(0)
         captureBeat = view.beat
         for seat in 0 ..< Seats: captureViews.add(view.buildObservation(seat))
-      result = client.decideAll(view, seats, prompts, kinds,
-        proc (seconds: float) {.closure.} = sleep(int(seconds * 1000.0)))
-      if not shared.trajectory.isNil: captureEvidence = client.nativeAttempts
+      result = newSeq[Decision](seats.len)
+      var managedSeats: seq[int]
+      var managedIndices: seq[int]
+      for index, seat in seats:
+        if not external[seat]:
+          managedSeats.add(seat)
+          managedIndices.add(index)
+      if managedSeats.len > 0:
+        let managed = client.decideAll(view, managedSeats, prompts, kinds,
+          proc (seconds: float) {.closure.} = sleep(int(seconds * 1000.0)))
+        for pos, index in managedIndices:
+          result[index] = managed[pos]
+      if not shared.trajectory.isNil:
+        captureEvidence =
+          if client.nativeAttempts.len == Seats: client.nativeAttempts
+          else: newSeq[seq[DecisionAttempt]](Seats)
       if external.anyIt(it):
         let started = epochTime()
         let deadline = started + config.llmTimeoutSeconds.float
@@ -331,12 +345,22 @@ proc runGame(cfg: RuntimeConfig) {.gcsafe.} =
         for index, seat in seats:
           if external[seat]:
             var action: JsonNode
+            var rejection: string
             withLock stateLock:
               action = shared.pendingActions[seat]
-            if not action.isNil:
-              result[index] = parseDecision(action)
-              result[index].source = osExternal
-              result[index].latencyMs = int((epochTime() - started) * 1000)
+              rejection = shared.pendingRejections[seat]
+            if action.isNil:
+              let detail =
+                if rejection.len > 0:
+                  "external seat " & $seat & " failed: " & rejection
+                else:
+                  "external seat " & $seat & " did not submit a valid action"
+              let err = newException(DecisionFailureError, detail)
+              err.slot = seat
+              raise err
+            result[index] = parseDecision(action)
+            result[index].source = osExternal
+            result[index].latencyMs = int((epochTime() - started) * 1000)
 
     proc onBeat(view: Sim) {.closure.} =
       if not shared.trajectory.isNil:
@@ -354,7 +378,22 @@ proc runGame(cfg: RuntimeConfig) {.gcsafe.} =
         " thefts ", view.cogs[0].thefts, "/", view.cogs[1].thefts,
         " at ", int(now()), "s"
 
-    runEpisode(gameSim, decide, now, onBeat)
+    try:
+      runEpisode(gameSim, decide, now, onBeat)
+    except DecisionFailureError as failure:
+      echo "coins: player failure on seat ", failure.slot, ": ", failure.msg
+      if not shared.trajectory.isNil and failure.slot >= 0 and
+          failure.slot < captureViews.len:
+        let evidence =
+          if failure.slot < client.nativeAttempts.len:
+            client.nativeAttempts[failure.slot]
+          else:
+            @[]
+        shared.trajectory.recordFailedDecision(config, captureBeat,
+          failure.slot, gameSim.policyNames[failure.slot],
+          captureViews[failure.slot], evidence, failure.msg)
+      gameSim.endEpisode(erForfeit)
+      declarePlayerFailure(failure.slot, failure.msg)
     withLock stateLock:
       pushStateFrames()
     finishEpisode()
@@ -487,22 +526,18 @@ proc handleRegister(slot: int, payload: JsonNode) =
   if prompt.runeLen > MaxPromptRunes:
     prompt = prompt.runeSubStr(0, MaxPromptRunes)
   let node = payload{"scripted"}
-  var kind =
-    if node == nil or node.kind == JNull: skNone
-    elif node.kind == JBool: (if node.getBool(): skReciprocator else: skNone)
-    else: parseScriptKind(node.getStr())
-  if node != nil and node.kind == JString and kind == skNone and
-      node.getStr().strip().len > 0:
-    ## A misspelled PLAYER_SCRIPTED is `skNone`, which this server reads as
-    ## "an LLM seat" — the seat then plays the default prompt with real
-    ## credentials, or the reciprocator without them, and nothing in the log
-    ## ever names the typo. Say it once, on the seat's own registration.
-    echo "coins: slot ", slot, " registered scripted=\"", node.getStr(),
-      "\", which is not one of ", ScriptedNames,
-      " — this seat is treated as an LLM seat"
-  if prompt.strip().len == 0 and kind == skNone:
-    ## Registered with neither field: play the default baseline.
-    kind = skReciprocator
+  var kind = skNone
+  if node != nil and node.kind != JNull:
+    if node.kind != JString:
+      raise newException(CoinsError,
+        "scripted must be one of " & $ScriptedNames)
+    let raw = node.getStr().strip()
+    if raw.len > 0:
+      kind = parseScriptKind(raw)
+      if kind == skNone:
+        raise newException(CoinsError,
+          "unknown scripted baseline \"" & raw & "\"; expected one of " &
+          $ScriptedNames)
   var policy = payload{"policy"}.getStr()
   if policy.runeLen > MaxPolicyLabelRunes:
     policy = policy.runeSubStr(0, MaxPolicyLabelRunes)
@@ -560,8 +595,23 @@ proc websocketHandler(websocket: WebSocket, event: WebSocketEvent,
             shared.everRegistered[slot] = true
           return
         if payload{"type"}.getStr() == "action":
-          let action = payload["action"]
-          discard parseDecision(action)
+          let action = payload{"action"}
+          try:
+            discard parseDecision(action)
+          except CatchableError as error:
+            withLock stateLock:
+              if shared.external[slot] and payload{"id"}.getInt(-1) ==
+                  shared.decisionId:
+                shared.pendingRejections[slot] = error.msg
+            try:
+              websocket.send($ %*{
+                "type": "rejected",
+                "id": payload{"id"},
+                "error": error.msg
+              })
+            except CatchableError:
+              discard
+            return
           withLock stateLock:
             if shared.external[slot] and payload["id"].getInt() ==
                 shared.decisionId and shared.pendingActions[slot].isNil:
@@ -573,7 +623,11 @@ proc websocketHandler(websocket: WebSocket, event: WebSocketEvent,
           return
         handleRegister(slot, payload)
       except CatchableError as error:
-        echo "coins: ignoring bad player frame: ", error.msg
+        echo "coins: rejecting bad player frame: ", error.msg
+        try:
+          websocket.send($ %*{"type": "rejected", "error": error.msg})
+        except CatchableError:
+          discard
     of ErrorEvent:
       discard
     of CloseEvent:
@@ -611,6 +665,7 @@ proc runGameServer*(config: GameConfig, cfg: RuntimeConfig) =
   shared.scripted = newSeq[ScriptKind](shared.seats)
   shared.external = newSeq[bool](shared.seats)
   shared.pendingActions = newSeq[JsonNode](shared.seats)
+  shared.pendingRejections = newSeq[string](shared.seats)
   shared.policies = newSeq[string](shared.seats)
   shared.registered = newSeq[bool](shared.seats)
   shared.everRegistered = newSeq[bool](shared.seats)

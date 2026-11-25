@@ -81,6 +81,9 @@ for entry in cert{"players"}:
 check(manifest{"player"}.len == Seats,
   "exactly " & $Seats & " player entries: a third could not be seated in a " &
   "2-seat fixture and would fail players_missing")
+check(seated.len == Seats and seated[0] == "coins-player" and
+  seated[1] == "coins-reciprocator",
+  "certification seats coins-player in seat 0 against coins-reciprocator in seat 1")
 for entry in manifest{"player"}:
   let id = entry{"id"}.getStr()
   check(id in seated,
@@ -91,6 +94,14 @@ for entry in manifest{"player"}:
     "player '" & id & "' runs the player entrypoint")
   check(entry{"description"}.getStr().len > 0,
     "player '" & id & "' carries a description")
+  if id == "coins-player":
+    check(entry{"env"}{"COWORLD_LLM_ENABLED"}.getStr() == "true",
+      "ordinary player 'coins-player' declares COWORLD_LLM_ENABLED=true")
+    check(entry{"env"}{"PLAYER_SCRIPTED"}.isNil,
+      "ordinary player 'coins-player' does not set PLAYER_SCRIPTED")
+  else:
+    check(entry{"env"}{"PLAYER_SCRIPTED"}.getStr() == "reciprocator",
+      "scripted opponent '" & id & "' explicitly selects reciprocator")
 
 # ---------------------------------------------------------------------------
 echo "--- the static replay bundle, and no /client/replay pod viewer"

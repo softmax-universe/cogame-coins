@@ -130,7 +130,7 @@ when isMainModule:
       response = %*{"response": $action}
     of "step":
       doAssert not game.finished and request["decision_id"].getInt() == id
-      let action = parseJson(request["response"].getStr())
+      let action = extractJsonObject(request["response"].getStr())
       decisions[seat] = parseDecision(action)
       inc seat
       if seat == Seats:

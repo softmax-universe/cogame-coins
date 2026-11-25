@@ -75,6 +75,8 @@ const
 
 type
   CoinsError* = object of CatchableError
+  DecisionFailureError* = object of CoinsError
+    slot*: int
 
   Colour* = enum
     ccCopper = "copper"
@@ -91,7 +93,6 @@ type
     osLlm = "llm"
     osExternal = "external"
     osRetry = "retry"
-    osFallback = "fallback"
     osScripted = "scripted"
 
   BlockReason* = enum
@@ -173,8 +174,8 @@ proc parseColour*(text: string): Colour =
   else: raise newException(CoinsError, "unknown coin colour: " & text)
 
 proc parseIntent*(text: string): Intent =
-  ## Case-insensitive, per the reply schema.
-  case text.strip().toLowerAscii().replace("-", "_").replace(" ", "_")
+  ## Exact canonical intent names only.
+  case text.strip()
   of "take_mine": inTakeMine
   of "take_any": inTakeAny
   of "take_theirs": inTakeTheirs

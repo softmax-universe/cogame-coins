@@ -10,9 +10,8 @@
 ## cumulatively), `theirTheftsInBeat(b)` from `beatLog`, and
 ## `ownCoinExists` / `theirCoinExists` from `coins`.
 ##
-## `reciprocator` is also the FALLBACK move used whenever an LLM seat's
-## decision fails, the policy a never-connected seat plays, and the baseline
-## the offline certification fixture leans on.
+## Explicit baseline policies are selected via `PLAYER_SCRIPTED` with one of
+## the four canonical names: `honest`, `greedy`, `reciprocator`, `tit-for-tat`.
 
 import std/[json, strutils]
 import sim_types
@@ -28,12 +27,12 @@ type
 const ScriptedNames* = ["honest", "greedy", "reciprocator", "tit-for-tat"]
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## `PLAYER_SCRIPTED` values. "1"/"true"/"yes" pick the strongest baseline.
-  case text.strip().toLowerAscii()
-  of "honest", "cooperate", "always-cooperate": skHonest
-  of "greedy", "defect", "always-defect": skGreedy
-  of "1", "true", "yes", "reciprocator", "recip": skReciprocator
-  of "tit-for-tat", "titfortat", "tit_for_tat", "tft": skTitForTat
+  ## Canonical `PLAYER_SCRIPTED` names only.
+  case text.strip()
+  of "honest": skHonest
+  of "greedy": skGreedy
+  of "reciprocator": skReciprocator
+  of "tit-for-tat": skTitForTat
   else: skNone
 
 # ---------------------------------------------------------------------------
@@ -140,5 +139,6 @@ proc scriptedIntent*(kind: ScriptKind, obs: JsonNode,
   case kind
   of skHonest: honestIntent(obs)
   of skGreedy: greedyIntent(obs)
+  of skReciprocator: reciprocatorIntent(obs, punishThreshold, punishBeats)
   of skTitForTat: titForTatIntent(obs)
-  else: reciprocatorIntent(obs, punishThreshold, punishBeats)
+  of skNone: raise newException(CoinsError, "no scripted baseline selected")

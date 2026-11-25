@@ -149,9 +149,8 @@ jobs:
           done
           exit "${fail}"
 
-      # The reciprocator is the baseline every LLM failure path falls back to,
-      # the one a never-connected seat plays, and the one the offline
-      # certification fixture leans on -- so its three knobs are SEARCHED, not
+      # The reciprocator is the published baseline opponent seated against
+      # coins-player in certification -- so its three knobs are SEARCHED, not
       # guessed. tools/tune_baseline.nim plays the whole
       # punishThreshold x punishBeats x truceBeats grid against all four
       # baselines over seeds 1..8 at certification length, prints the ranked
@@ -343,18 +342,12 @@ jobs:
             --strict-text-bounds
 
       # -----------------------------------------------------------------
-      # THE CI REPLAY CANNOT TALK. docker_smoke.sh runs with no
-      # ANTHROPIC_API_KEY, so every seat falls back to a scripted baseline and
-      # a scripted decision carries no `say` (src/coins/llm.nim's
-      # fallbackDecision). Every replay this workflow can produce therefore
-      # carries ZERO LLM text: the step above reported `feed_lines: 0` and
-      # `canvas text: 0 drawn` over the one class of chrome that exists only
-      # to show what a model said, and `total: 0` "means the check covered
-      # nothing" (prompts/30-review-loop.md item 15; cogchemists 2026-08-24
-      # shipped four clipped speech bubbles behind a fully green board for
-      # exactly this reason).
+      # In addition to the smoke replay (which exercises a deterministic local
+      # HTTP model fixture for seat 0), render a worst-case remark fixture so
+      # the viewer's speech band is stress-tested at full 48-rune width across
+      # six stage widths and CJK/Latin/sentence shapes.
       #
-      # So this step hands the REAL page -- client/replay_broadcast.html
+      # This step hands the REAL page -- client/replay_broadcast.html
       # spliced the way it is served, with its socket stubbed -- four full-cap
       # 48-rune remarks at once, one on every seat, at six stage widths from
       # the 360 px featured-match iframe up past the --hudscale clamp, in

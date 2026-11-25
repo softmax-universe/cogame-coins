@@ -38,9 +38,15 @@
 #                              job loads it in a real browser -- that is the
 #                              only replay in CI that is known to be readable
 #                              by this game's own viewer.
-#   ANTHROPIC_API_KEY          if set, forwarded to the game so the LLM path
-#                              is exercised; if unset the game must fall back
-#                              to its scripted baselines and still complete
+#   COWORLD_LLM_ENDPOINT       if set, forwarded to the game; otherwise if
+#                              ANTHROPIC_API_KEY is also unset, this script
+#                              starts a deterministic local HTTP /v1/messages
+#                              model fixture so seat 0 (coins-player) executes
+#                              real HTTP model moves against seat 1
+#                              (coins-reciprocator).
+#   ANTHROPIC_API_KEY          if set (and COWORLD_LLM_ENDPOINT is unset),
+#                              forwarded to the game so the Anthropic path is
+#                              exercised.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -65,8 +71,13 @@ prefix="${slug}-smoke-${run_id}"
 network="${prefix}-net"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/${slug}-smoke.XXXXXX")"
 seats=0
+mock_pid=""
 
 cleanup() {
+  if [ -n "${mock_pid}" ]; then
+    kill "${mock_pid}" >/dev/null 2>&1 || true
+    wait "${mock_pid}" >/dev/null 2>&1 || true
+  fi
   docker ps -aq --filter "name=${prefix}" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "${network}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}"
@@ -191,16 +202,86 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 game_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+used_mock_llm=0
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+  if [ -n "${COWORLD_LLM_MODEL:-}" ]; then
+    game_env+=(-e "COWORLD_LLM_MODEL=${COWORLD_LLM_MODEL}")
+  fi
+  echo "COWORLD_LLM_ENDPOINT present: using caller-supplied LLM endpoint"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
-  echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
+  echo "ANTHROPIC_API_KEY present: the Anthropic LLM path will be exercised"
 else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  used_mock_llm=1
+  python3 - "${work_dir}/mock_llm.port" "${work_dir}/mock_llm.calls.jsonl" <<'PY' &
+import json
+import re
+import sys
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+port_file, calls_file = sys.argv[1], sys.argv[2]
+
+class FixtureHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        if self.path != "/v1/messages":
+            self.send_response(404)
+            self.end_headers()
+            return
+        raw = self.rfile.read(int(self.headers["Content-Length"]))
+        body = json.loads(raw)
+        user = body["messages"][0]["content"]
+        beat = int(re.search(r"BEAT (\d+)", user)[1])
+        slot = int(self.headers.get("X-Coworld-Player-Slot", "-1"))
+        if beat == 2:
+            action = {"intent": "guard", "say": "guarding copper", "notes": "beat 2 guard"}
+        else:
+            action = {"intent": "take_mine", "say": "keeping mine", "notes": f"beat {beat}"}
+        with open(calls_file, "a") as fh:
+            fh.write(json.dumps({"beat": beat, "slot": slot, "intent": action["intent"]}) + "\n")
+        response = json.dumps({
+            "model": body.get("model", "docker-smoke-fixture"),
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": json.dumps(action)}],
+            "usage": {"input_tokens": 100, "output_tokens": 20},
+        }).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response)))
+        self.send_header("X-Softmax-Llm-Call-Id", str(uuid.uuid5(uuid.NAMESPACE_URL, raw.decode())))
+        self.end_headers()
+        self.wfile.write(response)
+
+server = ThreadingHTTPServer(("0.0.0.0", 0), FixtureHandler)
+with open(port_file, "w") as fh:
+    fh.write(str(server.server_port))
+server.serve_forever()
+PY
+  mock_pid="$!"
+  for _ in $(seq 1 50); do
+    if [ -s "${work_dir}/mock_llm.port" ]; then break; fi
+    sleep 0.1
+  done
+  if [ ! -s "${work_dir}/mock_llm.port" ]; then
+    echo "FAIL: deterministic local HTTP model fixture failed to start" >&2
+    exit 1
+  fi
+  mock_port="$(cat "${work_dir}/mock_llm.port")"
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=http://host.docker.internal:${mock_port}")
+  game_env+=(-e "COWORLD_LLM_MODEL=docker-smoke-fixture")
+  echo "started deterministic local HTTP model fixture on port ${mock_port}"
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."
 docker run -d --name "${prefix}-game" \
   --network "${network}" --network-alias "${prefix}-game" \
+  --add-host=host.docker.internal:host-gateway \
   -e COGAME_HOST=0.0.0.0 \
   -e COGAME_PORT="${port}" \
   -e COGAME_CONFIG_URI=file:///coworld/config.json \
@@ -268,7 +349,7 @@ echo "all ${seats} player containers exited 0"
 # --------------------------------------------------------------------------
 # Assert the artifacts.
 # --------------------------------------------------------------------------
-if ! python3 - "${work_dir}" "${seats}" "${require_replay_json}" <<'PY'
+if ! python3 - "${work_dir}" "${seats}" "${require_replay_json}" "${used_mock_llm}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -276,6 +357,7 @@ from pathlib import Path
 work = Path(sys.argv[1])
 seats = int(sys.argv[2])
 require_replay_json = sys.argv[3] not in ("0", "", "false", "no")
+used_mock_llm = sys.argv[4] == "1"
 
 failure = work / "player_failure.json"
 if failure.exists():
@@ -302,18 +384,44 @@ for key in ("names", "scores"):
 reason = results.get("reason") or results.get("end_reason")
 if reason is not None:
     print(f"episode end reason: {reason}")
+if reason not in ("random_end", "beat_cap"):
+    raise SystemExit(f"unexpected episode end reason: {reason!r}")
 
 replay_path = work / "replay.json"
 if not replay_path.exists() or replay_path.stat().st_size == 0:
     raise SystemExit("replay missing or empty (COGAME_SAVE_REPLAY_URI was file:///coworld/replay.json)")
+replay = None
 if require_replay_json:
     try:
-        json.loads(replay_path.read_bytes().decode("utf-8"))
+        replay = json.loads(replay_path.read_bytes().decode("utf-8"))
     except Exception as exc:
         raise SystemExit(
             f"replay is not valid UTF-8 JSON: {exc} "
             "(set SMOKE_REQUIRE_REPLAY_JSON=0 for a binary replay format)"
         ) from exc
+
+if used_mock_llm:
+    calls_path = work / "mock_llm.calls.jsonl"
+    if not calls_path.exists():
+        raise SystemExit("deterministic local HTTP model fixture received zero requests")
+    calls = [json.loads(line) for line in calls_path.read_text().splitlines() if line.strip()]
+    beats = int(results.get("beats", 0))
+    if len(calls) != beats:
+        raise SystemExit(f"expected {beats} HTTP model calls for seat 0, got {len(calls)}")
+    if any(c["slot"] != 0 for c in calls):
+        raise SystemExit(f"expected HTTP model calls only for seat 0, got {calls}")
+    orders = [e for e in (replay or {}).get("events", []) if e.get("k") == "order"]
+    seat0 = [e for e in orders if e.get("seat") == 0]
+    seat1 = [e for e in orders if e.get("seat") == 1]
+    if len(seat0) != beats or len(seat1) != beats:
+        raise SystemExit(f"unexpected order counts: seat0={len(seat0)} seat1={len(seat1)} beats={beats}")
+    if any(e.get("source") != "llm" for e in seat0):
+        raise SystemExit(f"seat 0 did not apply HTTP llm moves: {[e.get('source') for e in seat0]}")
+    if seat0[1].get("intent") != "guard" or seat0[1].get("say") != "guarding copper":
+        raise SystemExit(f"seat 0 beat 2 did not apply returned HTTP move: {seat0[1]}")
+    if any(e.get("source") != "scripted" for e in seat1):
+        raise SystemExit(f"seat 1 did not stay scripted: {[e.get('source') for e in seat1]}")
+    print(f"verified {len(calls)} HTTP /v1/messages calls applied on seat 0 vs scripted seat 1")
 
 print(
     f"smoke OK: seats={seats} results={results_path.stat().st_size}B "

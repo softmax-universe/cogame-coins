@@ -11,8 +11,10 @@ capture is disabled.
 Capture retains actual parallel Curly request bodies, exposed call-ID headers,
 received response bodies, retries and each seat's beat-opening observation.
 At beat close it joins the decision to the actual applied intent, speech and
-private notebook. Replies normalized by the native rune caps and scripted
-fallbacks are excluded from model targets. Unavailable usage, token identities
+private notebook. Replies normalized by the native rune caps are marked
+rejected, and exhausted retries or missing credentials end the episode with an
+explicit player failure (`forfeit`) without synthesizing a fallback action.
+Unavailable usage, token identities
 and likelihoods remain unknown. Speech stays spectator-only; the other seat
 never gains access to private evidence. Requests, retry policy, pacing, random
 termination, movement and scoring remain game-owned.
@@ -32,8 +34,9 @@ nim c -d:release --path:src -o:/tmp/coins-player src/coins_player.nim
 python3 tools/test_native_capture.py /tmp/coins /tmp/coins-player /tmp/coins-native-capture
 ```
 
-It checks applied-action/replay joins, private operator isolation, retries,
-fallback, normalization, missing usage and offline no-evidence fallback. Outcomes and physical replays agree
+It checks applied-action/replay joins, private operator isolation, model-vs-baseline
+HTTP execution, outer Markdown JSON fences, retries, normalization, missing usage,
+and explicit player failure on exhausted invalid replies or missing credentials. Outcomes and physical replays agree
 across capture modes; measured wall-clock latency is retained in raw artifacts
 and omitted only from the parity comparison. Fixture replies are software
 tests, not training teachers. Output directories must be new.

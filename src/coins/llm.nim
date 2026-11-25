@@ -2,21 +2,20 @@
 ## GAME server composes each seat's observation plus that seat's prompt and
 ## asks Claude what it does this beat.
 ##
-## Forked from `cogame-bullwhip/src/bullwhip/llm.nim`. Decisions are
-## SIMULTANEOUS by rule, so both seats' requests go out as ONE parallel batch
-## (`curly.makeRequests`) at every beat close — never sequentially, never one
-## seat waiting on the other. An invalid reply is retried ONCE, in the same
-## beat, with a hint; anything still failing falls back to the scripted
-## `reciprocator` move.
+## Decisions are SIMULTANEOUS by rule, so both seats' requests go out as ONE
+## parallel batch (`curly.makeRequests`) at every beat close — never
+## sequentially, never one seat waiting on the other. An invalid reply is
+## retried ONCE, in the same beat, with a hint; anything still failing raises
+## `DecisionFailureError` so the game ends explicitly without synthesizing an
+## action.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With none present the client disables itself immediately and every seat
-## plays `reciprocator`, which is what keeps offline certification green and
-## deterministic.
+## With none present the client disables itself immediately; any non-scripted
+## seat then fails explicitly rather than falling back to a baseline.
 
 import
   std/[json, options, os, strutils, times],
@@ -125,7 +124,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "coins llm: no LLM credentials; every seat plays reciprocator"
+    echo "coins llm: no LLM credentials configured"
 
 # ---------------------------------------------------------------------------
 # text hygiene
@@ -266,24 +265,53 @@ const RetryHint* =
 # reply parsing
 # ---------------------------------------------------------------------------
 
+proc unwrapMarkdownJsonFence(text: string): string =
+  result = text.strip()
+  if not result.startsWith("```"):
+    return
+  let firstNewline = result.find('\n')
+  if firstNewline < 0:
+    return
+  let header = result[3 ..< firstNewline].strip().toLowerAscii()
+  if header.len > 0 and header != "json":
+    return
+  if not result.endsWith("```"):
+    return
+  let inner = result[firstNewline + 1 ..< result.len - 3]
+  if inner.len == 0 or not (inner.endsWith("\n") or inner.endsWith("\r")):
+    return
+  result = inner.strip()
+
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences,
-  ## a prose preamble and trailing prose after the closing brace.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
+  ## Parses a JSON object reply, tolerating only an optional standard outer
+  ## Markdown JSON fence. Prose preambles and trailing prose are rejected.
+  let candidate = unwrapMarkdownJsonFence(text)
+  if candidate.len == 0 or candidate[0] != '{' or candidate[^1] != '}':
     var head = text.strip()
     if head.len > 160:
       head = head[0 ..< 160] & "..."
     raise newException(CoinsError,
       "no JSON object in response: " & head.replace("\n", " "))
-  parseJson(text[start .. stop])
+  let parsed = parseJson(candidate)
+  if parsed.kind != JObject:
+    raise newException(CoinsError, "reply must be a JSON object")
+  parsed
 
 proc parseDecision*(payload: JsonNode): Decision =
-  ## `intent` is required and must be one of the five (case-insensitive).
-  ## `say` and `notes` are optional and both carry a RUNE cap.
-  result.say = cleanSay(payload{"say"}.getStr())
-  result.notes = cleanNotes(payload{"notes"}.getStr())
+  ## `intent` is required and must be one of the five canonical intents.
+  ## `say` and `notes` are optional strings and both carry a RUNE cap.
+  if payload == nil or payload.kind != JObject:
+    raise newException(CoinsError, "decision payload must be a JSON object")
+  let sayNode = payload{"say"}
+  if sayNode != nil and sayNode.kind != JNull:
+    if sayNode.kind != JString:
+      raise newException(CoinsError, "say must be a string")
+    result.say = cleanSay(sayNode.getStr())
+  let notesNode = payload{"notes"}
+  if notesNode != nil and notesNode.kind != JNull:
+    if notesNode.kind != JString:
+      raise newException(CoinsError, "notes must be a string")
+    result.notes = cleanNotes(notesNode.getStr())
   let node = payload{"intent"}
   if node == nil or node.kind != JString:
     raise newException(CoinsError, "no intent in response")
@@ -358,15 +386,6 @@ proc textOf(client: LlmClient, response: Response, error, url: string):
 # the batch
 # ---------------------------------------------------------------------------
 
-proc fallbackDecision*(view: Sim, slot: int, source: OrderSource): Decision =
-  ## The scripted `reciprocator` move — the strongest of the four against an
-  ## unknown opponent, and the move every failure path lands on.
-  Decision(
-    intent: scriptedIntent(skReciprocator, view.buildObservation(slot),
-      view.config.punishThreshold, view.config.punishBeats),
-    source: source
-  )
-
 proc scriptedDecision*(view: Sim, slot: int, kind: ScriptKind): Decision =
   Decision(
     intent: scriptedIntent(kind, view.buildObservation(slot),
@@ -383,11 +402,16 @@ proc pacedWait*(client: LlmClient, nowSeconds: float): float =
   let due = client.lastBatchAt + client.minBeatSeconds.float
   if due > nowSeconds: due - nowSeconds else: 0.0
 
+proc newDecisionFailure(slot: int, message: string): ref DecisionFailureError =
+  result = newException(DecisionFailureError, message)
+  result.slot = slot
+
 proc decideAll*(client: LlmClient, view: Sim, seats: seq[int],
     prompts: seq[string], scripted: seq[ScriptKind],
     sleepFor: proc (seconds: float) {.closure.} = nil): seq[Decision] =
-  ## One decision per seat in `seats`, in order. NEVER raises: any failure
-  ## falls back to the scripted move so the episode always advances.
+  ## One decision per seat in `seats`, in order. Raises `DecisionFailureError`
+  ## if any non-scripted seat cannot produce a valid decision — never
+  ## synthesizes a fallback move.
   let capture = getEnv(CogameSaveTrajectoryUriEnv).len > 0
   if capture: client.nativeAttempts = newSeq[seq[DecisionAttempt]](Seats)
   result = newSeq[Decision](seats.len)
@@ -397,7 +421,13 @@ proc decideAll*(client: LlmClient, view: Sim, seats: seq[int],
     if kind != skNone:
       result[index] = scriptedDecision(view, seat, kind)
     elif client.disabled:
-      result[index] = fallbackDecision(view, seat, osFallback)
+      let reason = "LLM credentials unavailable for seat " & $seat
+      if capture:
+        var attempt = newDecisionAttempt($view.beat & "-" & $seat & "-attempt-0",
+          view.policyNames[seat], aoModel)
+        attempt.rejectionReason = some(reason)
+        client.nativeAttempts[seat].add(attempt)
+      raise newDecisionFailure(seat, reason)
     else:
       open.add(index)
   if open.len == 0:
@@ -410,6 +440,7 @@ proc decideAll*(client: LlmClient, view: Sim, seats: seq[int],
   client.lastBatchAt = epochTime()
   client.batchStarts.add(client.lastBatchAt)
 
+  var lastErrors = newSeq[string](seats.len)
   for attempt in 0 .. 1:
     if open.len == 0 or client.disabled:
       break
@@ -417,13 +448,6 @@ proc decideAll*(client: LlmClient, view: Sim, seats: seq[int],
     var stillOpen: seq[int]
     var pendingEvidence: seq[DecisionAttempt]
     var recorded = 0
-    ## The per-seat `try` below covers everything Coins itself can raise
-    ## (transport status, refusal, parse, unknown intent). This outer one
-    ## covers the BATCH: building an observation or a request, and
-    ## `makeRequests` raising rather than returning a per-request `.error`.
-    ## `decideAll` never raises — a raise here would leave `runEpisode` on the
-    ## episode thread, and the container would serve /healthz until the
-    ## platform's own timeout instead of settling.
     try:
       var batch: RequestBatch
       for index in open:
@@ -463,6 +487,7 @@ proc decideAll*(client: LlmClient, view: Sim, seats: seq[int],
           result[index] = decision
         except CatchableError as error:
           if capture: evidence.rejectionReason = some(error.msg)
+          lastErrors[index] = error.msg
           echo "coins llm: seat ", seat, " attempt ", attempt, " failed: ",
             error.msg
           stillOpen.add(index)
@@ -475,10 +500,16 @@ proc decideAll*(client: LlmClient, view: Sim, seats: seq[int],
           var evidence = pendingEvidence[position]
           evidence.rejectionReason = some("batch failure: " & error.msg)
           client.nativeAttempts[seats[open[position]]].add(evidence)
+      for index in open:
+        lastErrors[index] = "batch failure: " & error.msg
       echo "coins llm: batch attempt ", attempt, " failed: ", error.msg
       stillOpen = open
     open = stillOpen
-  for index in open:
-    let seat = seats[index]
-    echo "coins llm: seat ", seat, " falling back to scripted intent"
-    result[index] = fallbackDecision(view, seat, osFallback)
+  if open.len > 0:
+    let failedIndex = open[0]
+    let failedSeat = seats[failedIndex]
+    let detail =
+      if lastErrors[failedIndex].len > 0: lastErrors[failedIndex]
+      else: "model decision failed"
+    raise newDecisionFailure(failedSeat,
+      "seat " & $failedSeat & " decision failed: " & detail)

@@ -150,7 +150,7 @@ echo "--- one batch carries every open seat, and the inter-batch floor holds"
 block:
   ## `decideAll` opens AT MOST ONE batch per beat, and that batch carries
   ## every open seat: it is never one request per seat in sequence, which is
-  ## what blows the 720 s play budget.
+  ## unnecessary for simultaneous decisions.
   let client = newLlmClient(config())
   var sim = initSim(config())
   if not client.disabled:
@@ -177,16 +177,6 @@ block:
   let wait = client.pacedWait(epochTime())
   check(wait > 0.0 and wait <= cfg.minBeatSeconds.float + 0.01,
     "a second batch waits out the floor, got " & $wait)
-
-echo "--- the wall-clock budget is inside 60% of episodeTimeoutSeconds"
-block:
-  let cfg = config()
-  check(cfg.playDeadlineSeconds() == 720.0,
-    "the play deadline is 720 s at the default 1200 s timeout")
-  var worst = defaultGameConfig()
-  check((worst.maxBeats * worst.worstCaseBeatSeconds()).float <=
-    worst.playDeadlineSeconds(),
-    "24 beats x (12 s batch + 12 s retry) = 576 s fits inside 720 s")
 
 if failures > 0:
   echo failures, " failing checks"

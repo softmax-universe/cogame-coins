@@ -9,14 +9,15 @@ sidecar; no unused `USE_BEDROCK` environment flag is needed. Set the private
 capture is disabled.
 
 Capture retains actual parallel Curly request bodies, exposed call-ID headers,
-received response bodies, retries and each seat's beat-opening observation.
+received response bodies and each seat's beat-opening observation.
 At beat close it joins the decision to the actual applied intent, speech and
-private notebook. Replies normalized by the native rune caps are marked
-rejected, and exhausted retries or missing credentials end the episode with an
-explicit player failure (`forfeit`) without synthesizing a fallback action.
+private notebook. When the game clips optional speech or notes, the trace records the accepted
+action exactly as played. Each model seat receives one request per beat. Invalid
+actions and provider failures end the episode without scores. The failure record
+identifies the affected seat.
 Unavailable usage, token identities
 and likelihoods remain unknown. Speech stays spectator-only; the other seat
-never gains access to private evidence. Requests, retry policy, pacing, random
+never gains access to private evidence. Requests, pacing, random
 termination, movement and scoring remain game-owned.
 
 Use the research package's `collect-hosted`, `prepare-hosted-data` and SLIME
@@ -35,7 +36,7 @@ python3 tools/test_native_capture.py /tmp/coins /tmp/coins-player /tmp/coins-nat
 ```
 
 It checks applied-action/replay joins, private operator isolation, model-vs-baseline
-HTTP execution, outer Markdown JSON fences, retries, normalization, missing usage,
+HTTP execution, outer Markdown JSON fences, one request per beat, normalization, missing usage,
 and explicit player failure on exhausted invalid replies or missing credentials. Outcomes and physical replays agree
 across capture modes; measured wall-clock latency is retained in raw artifacts
 and omitted only from the parity comparison. Fixture replies are software

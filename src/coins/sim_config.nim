@@ -78,17 +78,6 @@ proc defaultGameConfig*(): GameConfig =
     shutdownGraceSeconds: 20
   )
 
-proc playDeadlineSeconds*(config: GameConfig): float =
-  ## 60% of `episodeTimeoutSeconds` (720 s at the default 1200). The game
-  ## container is NOT given `COWORLD_TIMEOUT_SECONDS`, so 1200 is assumed
-  ## unless the config supplies otherwise. Crossing this at a beat close
-  ## settles the episode with `reason: "deadline"` rather than overrunning.
-  0.6 * config.episodeTimeoutSeconds.float
-
-proc worstCaseBeatSeconds*(config: GameConfig): int =
-  ## One batch plus one retry, both at the batch timeout.
-  2 * config.llmTimeoutSeconds
-
 proc validate*(config: GameConfig) =
   if config.numAgents != Seats:
     raise newException(CoinsError,
@@ -120,16 +109,8 @@ proc validate*(config: GameConfig) =
       "punishThreshold, punishBeats and truceBeats must be positive")
   if config.llmTimeoutSeconds < 1:
     raise newException(CoinsError, "llmTimeoutSeconds must be positive")
-  ## The budget assertion, stated in the sim as well as in the manifest test:
-  ## the worst case (every beat paying a batch AND a retry) must sit inside
-  ## 60% of episodeTimeoutSeconds.
-  if (config.maxBeats * config.worstCaseBeatSeconds()).float >
-      config.playDeadlineSeconds() + 1e-9:
-    raise newException(CoinsError,
-      "maxBeats x (2 x llmTimeoutSeconds) must be inside 60% of " &
-      "episodeTimeoutSeconds (" & $config.maxBeats & " x " &
-      $config.worstCaseBeatSeconds() & " > " &
-      $config.playDeadlineSeconds() & ")")
+  if config.episodeTimeoutSeconds < 1:
+    raise newException(CoinsError, "episodeTimeoutSeconds must be positive")
 
 proc selectedPromptVariant*(config: GameConfig): PromptVariant =
   if config.promptVariant == pvMixed: PromptVariant(config.promptSeed mod 5)

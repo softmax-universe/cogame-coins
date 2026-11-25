@@ -76,6 +76,7 @@ const
 type
   CoinsError* = object of CatchableError
   DecisionFailureError* = object of CoinsError
+    providerFailure*: bool
     slot*: int
 
   Colour* = enum
@@ -92,7 +93,6 @@ type
   OrderSource* = enum
     osLlm = "llm"
     osExternal = "external"
-    osRetry = "retry"
     osScripted = "scripted"
 
   BlockReason* = enum
@@ -104,7 +104,6 @@ type
     erRandomEnd = "random_end"
     erBeatCap = "beat_cap"
     erDeadline = "deadline"
-    erForfeit = "forfeit"
 
   Cog* = object
     ## Field order is sacred.

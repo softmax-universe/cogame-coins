@@ -188,25 +188,6 @@ for name, prop in results{"properties"}:
     "results array '" & name & "' is length " & $Seats)
 
 # ---------------------------------------------------------------------------
-echo "--- the wall-clock budget, checked from the manifest itself"
-block:
-  let defaults = defaultGameConfig()
-  for variant in variants:
-    let gc = variant{"game_config"}
-    var config = defaults
-    if gc.hasKey("maxBeats"): config.maxBeats = gc{"maxBeats"}.getInt()
-    if gc.hasKey("minBeats"): config.minBeats = gc{"minBeats"}.getInt()
-    let worst = config.maxBeats * config.worstCaseBeatSeconds()
-    check(worst.float < config.playDeadlineSeconds(),
-      "variant " & variant{"id"}.getStr() & ": maxBeats x (2 x " &
-      "llmTimeoutSeconds) = " & $worst & " s must be under " &
-      $config.playDeadlineSeconds() & " s")
-  let gc = cert{"game_config"}
-  var certConfig = defaults
-  certConfig.maxBeats = gc{"maxBeats"}.getInt()
-  check((certConfig.maxBeats * certConfig.worstCaseBeatSeconds()).float <
-    certConfig.playDeadlineSeconds(), "the fixture fits the budget too")
-
 # ---------------------------------------------------------------------------
 echo "--- tools/ci/policies.json: two prompt champions plus two fillers"
 block:

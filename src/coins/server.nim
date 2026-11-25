@@ -98,13 +98,15 @@ proc writeArtifact(uri, data, contentType, methodEnv: string) =
   else:
     writeCogameUri(uri, data, contentType, methodEnv)
 
-proc declarePlayerFailure(slot: int, message: string) =
-  try:
-    writeCogameEnv("COGAME_PLAYER_FAILURE_URI",
-      $(%*{"failed_policy_index": slot, "message": message}),
-      "application/json")
-  except CatchableError as error:
-    echo "coins: player-failure declaration failed: ", error.msg
+proc failEpisode(slot: int, message: string, providerFailure = false) {.noreturn.} =
+  let failure = %*{"failed_policy_index": slot, "message": message}
+  if providerFailure: failure["kind"] = %"episode_inconclusive"
+  writeCogameEnv("COGAME_PLAYER_FAILURE_URI", $failure, "application/json")
+  if not shared.trajectory.isNil:
+    shared.trajectory.finish(esFailed, failure, newJObject())
+    shared.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
+  echo "coins: unscored player failure: ", message
+  quit(1)
 
 # ---------------------------------------------------------------------------
 # broadcasting
@@ -256,14 +258,7 @@ proc runGame(cfg: RuntimeConfig) {.gcsafe.} =
         else:
           "player slot " & $failedSlot & " never registered within " &
             $config.playerConnectTimeoutSeconds & "s"
-      withLock stateLock:
-        for slot in 0 ..< Seats:
-          gameSim.cogs[slot].score = 0
-      gameSim.endEpisode(erForfeit)
-      declarePlayerFailure(failedSlot, message)
-      finishEpisode()
-      sleep(config.shutdownGraceSeconds * 1000)
-      quit(0)
+      failEpisode(failedSlot, message)
 
     let client = newLlmClient(config)
 
@@ -392,8 +387,7 @@ proc runGame(cfg: RuntimeConfig) {.gcsafe.} =
         shared.trajectory.recordFailedDecision(config, captureBeat,
           failure.slot, gameSim.policyNames[failure.slot],
           captureViews[failure.slot], evidence, failure.msg)
-      gameSim.endEpisode(erForfeit)
-      declarePlayerFailure(failure.slot, failure.msg)
+      failEpisode(failure.slot, failure.msg, failure.providerFailure)
     withLock stateLock:
       pushStateFrames()
     finishEpisode()

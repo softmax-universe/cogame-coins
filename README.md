@@ -247,6 +247,6 @@ python tools/test_prompt_export.py /absolute/path/to/export /new/private/output
 
 For a model study, freeze source, model, operator strategy, variants, game seeds,
 seats, opponents, and budgets before comparing canonical-trained and mixed-trained
-policies on held-out wordings. Report scores, invalid actions, retries, fallbacks,
+policies on held-out wordings. Report scores, invalid actions, provider failures,
 ending reasons, and completion rates. Scripted invariance does not establish
 improved learning or reduced model collapse.

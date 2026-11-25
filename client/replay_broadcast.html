@@ -2457,8 +2457,7 @@ button.beat-marker:focus-visible { outline: 1px solid var(--amber); }
     var reason = {
       random_end: 'ENDED AT RANDOM',
       beat_cap: 'RAN THE FULL DISTANCE',
-      deadline: 'CALLED ON TIME',
-      forfeit: 'FORFEIT'
+      deadline: 'CALLED ON TIME'
     }[o.reason] || String(o.reason || '').toUpperCase();
     var wc = cnDoc('ec-wincond');
     if (wc) {

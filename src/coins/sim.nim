@@ -436,15 +436,6 @@ proc closeBeat*(sim: var Sim): bool =
 proc endEpisode*(sim: var Sim, reason: EndReason) =
   if sim.finished:
     return
-  ## An episode that ends before its first tick — `forfeit`, where neither
-  ## seat connected — would otherwise write a replay whose `frames` array is
-  ## empty, and `parseReplayBytes` rejects that ("replay carries no frames"),
-  ## so the artifact the platform stores could not be opened. Record the
-  ## opening position as that episode's one frame; `ticksPlayed`,
-  ## `series.score` and `frames` stay in step.
-  if sim.frames.len == 0:
-    sim.recordFrame()
-    sim.tick.inc
   sim.finished = true
   sim.reason = reason
   sim.endBeat = sim.beatsPlayed
@@ -646,15 +637,7 @@ proc runEpisode*(sim: var Sim, decide: DecideProc, now: ClockProc,
       onBeat(sim)
     if not keepPlaying:
       break
-    ## The play deadline is checked at BEAT CLOSES only — and the NEXT beat's
-    ## worst case is reserved against it. A beat can pay a batch and a retry
-    ## (`worstCaseBeatSeconds` = 2 x llmTimeoutSeconds), so testing the bare
-    ## clock here would let the last beat start at the deadline and settle up
-    ## to that much past it. Crossing it settles with `reason: "deadline"` —
-    ## the beats played are scored exactly as they happened and nothing is
-    ## imputed for the beats not played.
-    if now() + sim.config.worstCaseBeatSeconds().float >=
-        sim.config.playDeadlineSeconds():
+    if now() >= sim.config.episodeTimeoutSeconds.float:
       sim.reason = erDeadline
       break
     sim.applyDecisions(decide(sim, seats))

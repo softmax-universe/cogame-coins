@@ -10,8 +10,8 @@ proc initNativeTrajectory*(config: GameConfig): DecisionTrajectory =
   newDecisionTrajectory(getEnv("COWORLD_EPISODE_ID"), "coins-" & $config.seed,
     "coins", getEnv("COWORLD_GAME_VERSION"), getEnv("COWORLD_SOURCE_REVISION"))
 
-proc nativeAttempt*(policy: string, turn, seat, retry: int, body: string): DecisionAttempt =
-  result = newDecisionAttempt($turn & "-" & $seat & "-attempt-" & $retry, policy, aoModel)
+proc nativeAttempt*(policy: string, turn, seat: int, body: string): DecisionAttempt =
+  result = newDecisionAttempt($turn & "-" & $seat & "-attempt-0", policy, aoModel)
   result.request = parseJson(body)
   result.prompt = %*[{"role": "system", "content": result.request["system"]}]
   for message in result.request["messages"]: result.prompt.add(copy(message))
@@ -63,12 +63,10 @@ proc recordAppliedDecision*(trajectory: DecisionTrajectory, config: GameConfig,
   let action = decision.decisionAction()
   var attempts = evidence
   var selected = none(string)
-  var status = asAccepted
   case decision.source
-  of osLlm, osRetry:
+  of osLlm:
     doAssert attempts.len > 0 and attempts[^1].parsedAction == action
-    if attempts[^1].accepted: selected = some(attempts[^1].attemptId)
-    else: status = asRejected
+    selected = some(attempts[^1].attemptId)
   of osScripted, osExternal:
     var attempt = newDecisionAttempt($beat & "-" & $seat & "-unknown", policy, aoUnknown)
     attempt.parsedAction = action
@@ -83,7 +81,7 @@ proc recordAppliedDecision*(trajectory: DecisionTrajectory, config: GameConfig,
         "prompt_template": promptMetadata(config, attempt.request["system"].getStr(),
           attempt.request["messages"][0]["content"].getStr())})
   trajectory.recordDecision($beat & "-" & $seat, $seat, view,
-    attempts, selected, action, status)
+    attempts, selected, action, asAccepted)
 
 proc recordFailedDecision*(trajectory: DecisionTrajectory, config: GameConfig,
     beat, seat: int, policy: string, observation: JsonNode,
@@ -114,7 +112,6 @@ proc finishNativeTrajectory*(trajectory: DecisionTrajectory, game: Sim) =
   let status =
     case game.reason
     of erRandomEnd, erBeatCap: esCompleted
-    of erForfeit: esFailed
     of erDeadline: esTruncated
   trajectory.finish(status, outcome, scores)
   trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))

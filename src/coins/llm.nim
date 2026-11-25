@@ -4,8 +4,7 @@
 ##
 ## Decisions are SIMULTANEOUS by rule, so both seats' requests go out as ONE
 ## parallel batch (`curly.makeRequests`) at every beat close — never
-## sequentially, never one seat waiting on the other. An invalid reply is
-## retried ONCE, in the same beat, with a hint; anything still failing raises
+## sequentially, never one seat waiting on the other. An invalid reply raises
 ## `DecisionFailureError` so the game ends explicitly without synthesizing an
 ## action.
 ##
@@ -40,8 +39,6 @@ type
     apiKey: string
     sidecarEndpoint: string
     bedrockEndpoint: string
-    bedrockModels: seq[string]
-    bedrockModel: int
     bedrockToken: string
     model: string
     maxOutputTokens: int
@@ -65,26 +62,9 @@ proc resolveApiKey(): string =
     echo "coins llm: failed to fetch ANTHROPIC_API_KEY_URI: ", error.msg
     result = ""
 
-proc bedrockModelIds*(): seq[string] =
-  ## Haiku ONLY (the raid learning): the sonnet fallback times out on every
-  ## sidecar call and turns one throttle into a cascade. `BEDROCK_MODEL`
-  ## pins a single id.
-  let pinned = getEnv("BEDROCK_MODEL").strip()
-  if pinned.len > 0:
-    return @[pinned]
-  @["us.anthropic.claude-haiku-4-5-20251001-v1:0"]
-
-proc tryNextBedrockModel(client: LlmClient, why: string): bool =
-  if client.transport != ltBedrock or
-      client.bedrockModel + 1 >= client.bedrockModels.len:
-    return false
-  client.bedrockModel.inc
-  echo "coins llm: rotating bedrock model (", why, ")"
-  true
-
 proc bedrockUrl(client: LlmClient): string =
   client.bedrockEndpoint & "/model/" &
-    client.bedrockModels[client.bedrockModel] & "/invoke"
+    client.model & "/invoke"
 
 proc newLlmClient*(config: GameConfig): LlmClient =
   result = LlmClient(
@@ -110,11 +90,11 @@ proc newLlmClient*(config: GameConfig): LlmClient =
       else: "https://bedrock-runtime." & region & ".amazonaws.com"
     result.transport = ltBedrock
     result.bedrockEndpoint = endpoint.strip(chars = {'/'}, leading = false)
-    result.bedrockModels = bedrockModelIds()
+    result.model = getEnv("BEDROCK_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
     result.bedrockToken = bedrockToken
     result.curl = newCurly()
     echo "coins llm: bedrock transport, model ",
-      result.bedrockModels[result.bedrockModel]
+      result.model
     return
   result.apiKey = resolveApiKey()
   if result.apiKey.len > 0:
@@ -256,46 +236,29 @@ proc userPrompt*(obs: JsonNode, prompt: string): string =
     " characters (spectators read it, the other cog never does); notes at " &
     "most " & $MaxNotesLen & " characters, returned to you next beat.")
 
-const RetryHint* =
-  "\nYour previous reply was invalid. Respond with ONLY the requested JSON " &
-  "object. `intent` must be exactly one of take_mine, take_any, " &
-  "take_theirs, guard, hold."
-
 # ---------------------------------------------------------------------------
 # reply parsing
 # ---------------------------------------------------------------------------
 
-proc unwrapMarkdownJsonFence(text: string): string =
-  result = text.strip()
-  if not result.startsWith("```"):
-    return
-  let firstNewline = result.find('\n')
-  if firstNewline < 0:
-    return
-  let header = result[3 ..< firstNewline].strip().toLowerAscii()
-  if header.len > 0 and header != "json":
-    return
-  if not result.endsWith("```"):
-    return
-  let inner = result[firstNewline + 1 ..< result.len - 3]
-  if inner.len == 0 or not (inner.endsWith("\n") or inner.endsWith("\r")):
-    return
-  result = inner.strip()
-
 proc extractJsonObject*(text: string): JsonNode =
-  ## Parses a JSON object reply, tolerating only an optional standard outer
-  ## Markdown JSON fence. Prose preambles and trailing prose are rejected.
-  let candidate = unwrapMarkdownJsonFence(text)
-  if candidate.len == 0 or candidate[0] != '{' or candidate[^1] != '}':
-    var head = text.strip()
-    if head.len > 160:
-      head = head[0 ..< 160] & "..."
-    raise newException(CoinsError,
-      "no JSON object in response: " & head.replace("\n", " "))
-  let parsed = parseJson(candidate)
-  if parsed.kind != JObject:
+  ## A single marked action can be surrounded by an explanation.
+  let stripped = text.strip()
+  if stripped.startsWith("{") and stripped.endsWith("}"):
+    return parseJson(stripped)
+  let parts = stripped.split("```")
+  var candidate = parts[0].strip()
+  if parts.len == 3:
+    let marked = parts[1].strip()
+    let newline = marked.find('\n')
+    if newline >= 0 and marked[0 ..< newline].strip().toLowerAscii() == "json":
+      candidate = marked[newline + 1 .. ^1].strip()
+    else:
+      candidate = marked
+  elif parts.len != 1:
+    raise newException(CoinsError, "expected one complete JSON action")
+  result = parseJson(candidate)
+  if result.kind != JObject:
     raise newException(CoinsError, "reply must be a JSON object")
-  parsed
 
 proc parseDecision*(payload: JsonNode): Decision =
   ## `intent` is required and must be one of the five canonical intents.
@@ -358,9 +321,6 @@ proc textOf(client: LlmClient, response: Response, error, url: string):
     raise newException(CoinsError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 300)]
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(CoinsError, "bedrock model access denied: " & detail)
     ## 401/403 disables the client for the rest of the episode.
     client.disabled = true
     raise newException(CoinsError,
@@ -402,9 +362,10 @@ proc pacedWait*(client: LlmClient, nowSeconds: float): float =
   let due = client.lastBatchAt + client.minBeatSeconds.float
   if due > nowSeconds: due - nowSeconds else: 0.0
 
-proc newDecisionFailure(slot: int, message: string): ref DecisionFailureError =
+proc newDecisionFailure(slot: int, message: string, providerFailure: bool): ref DecisionFailureError =
   result = newException(DecisionFailureError, message)
   result.slot = slot
+  result.providerFailure = providerFailure
 
 proc decideAll*(client: LlmClient, view: Sim, seats: seq[int],
     prompts: seq[string], scripted: seq[ScriptKind],
@@ -427,7 +388,7 @@ proc decideAll*(client: LlmClient, view: Sim, seats: seq[int],
           view.policyNames[seat], aoModel)
         attempt.rejectionReason = some(reason)
         client.nativeAttempts[seat].add(attempt)
-      raise newDecisionFailure(seat, reason)
+      raise newDecisionFailure(seat, reason, true)
     else:
       open.add(index)
   if open.len == 0:
@@ -440,76 +401,40 @@ proc decideAll*(client: LlmClient, view: Sim, seats: seq[int],
   client.lastBatchAt = epochTime()
   client.batchStarts.add(client.lastBatchAt)
 
-  var lastErrors = newSeq[string](seats.len)
-  for attempt in 0 .. 1:
-    if open.len == 0 or client.disabled:
-      break
-    let started = epochTime()
-    var stillOpen: seq[int]
-    var pendingEvidence: seq[DecisionAttempt]
-    var recorded = 0
+  let started = epochTime()
+  var batch: RequestBatch
+  for index in open:
+    let seat = seats[index]
+    let obs = view.buildObservation(seat)
+    let user = userPrompt(obs, (if seat < prompts.len: prompts[seat] else: ""))
+    let request = client.requestFor(systemPrompt(obs, view.config), user, seat)
+    if capture:
+      client.nativeAttempts[seat].add(nativeAttempt(view.policyNames[seat], view.beat, seat, request.body))
+    batch.post(request.url, request.headers, request.body, $index)
+  let responses =
+    try: client.curl.makeRequests(batch, client.timeoutSeconds)
+    except CatchableError as error:
+      raise newDecisionFailure(seats[open[0]], error.msg, true)
+  let latency = int((epochTime() - started) * 1000.0)
+  for position, index in open:
+    let seat = seats[index]
+    var providerFailure = true
     try:
-      var batch: RequestBatch
-      for index in open:
-        let seat = seats[index]
-        let obs = view.buildObservation(seat)
-        var user = userPrompt(obs,
-          (if seat < prompts.len: prompts[seat] else: ""))
-        if attempt > 0:
-          user.add(RetryHint)
-        let request = client.requestFor(systemPrompt(obs, view.config), user, seat)
-        if capture:
-          pendingEvidence.add(nativeAttempt(view.policyNames[seat], view.beat, seat, attempt, request.body))
-        batch.post(request.url, request.headers, request.body, $index)
-      let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
-      let latency = int((epochTime() - started) * 1000.0)
-      for position, index in open:
-        let seat = seats[index]
-        var evidence: DecisionAttempt
-        if capture: evidence = pendingEvidence[position]
-        try:
-          if position >= responses.len:
-            raise newException(CoinsError, "no response for seat " & $seat)
-          if capture:
-            evidence.receiveNativeResponse(responses[position].response, responses[position].error, latency)
-          let text = client.textOf(responses[position].response,
-            responses[position].error, batch[position].url)
-          let payload = extractJsonObject(text)
-          var decision = parseDecision(payload)
-          if capture:
-            evidence.parsedAction = decision.decisionAction()
-            evidence.accepted = payload{"say"}.getStr() == decision.say and
-              payload{"notes"}.getStr() == decision.notes
-            if not evidence.accepted:
-              evidence.rejectionReason = some("native parser normalized speech or notebook")
-          decision.source = if attempt == 0: osLlm else: osRetry
-          decision.latencyMs = latency
-          result[index] = decision
-        except CatchableError as error:
-          if capture: evidence.rejectionReason = some(error.msg)
-          lastErrors[index] = error.msg
-          echo "coins llm: seat ", seat, " attempt ", attempt, " failed: ",
-            error.msg
-          stillOpen.add(index)
-        if capture:
-          client.nativeAttempts[seat].add(evidence)
-          inc recorded
+      if position >= responses.len:
+        raise newException(CoinsError, "no response for seat " & $seat)
+      let reply = responses[position]
+      if capture:
+        client.nativeAttempts[seat][0].receiveNativeResponse(reply.response, reply.error, latency)
+      let text = client.textOf(reply.response, reply.error, batch[position].url)
+      providerFailure = false
+      var decision = parseDecision(extractJsonObject(text))
+      decision.source = osLlm
+      decision.latencyMs = latency
+      result[index] = decision
+      if capture:
+        client.nativeAttempts[seat][0].parsedAction = decision.decisionAction()
+        client.nativeAttempts[seat][0].accepted = true
     except CatchableError as error:
       if capture:
-        for position in recorded ..< pendingEvidence.len:
-          var evidence = pendingEvidence[position]
-          evidence.rejectionReason = some("batch failure: " & error.msg)
-          client.nativeAttempts[seats[open[position]]].add(evidence)
-      for index in open:
-        lastErrors[index] = "batch failure: " & error.msg
-      echo "coins llm: batch attempt ", attempt, " failed: ", error.msg
-      stillOpen = open
-    open = stillOpen
-  if open.len > 0:
-    let failedIndex = open[0]
-    let failedSeat = seats[failedIndex]
-    let detail =
-      if lastErrors[failedIndex].len > 0: lastErrors[failedIndex]
-      else: "model decision failed"
-    raise newDecisionFailure(failedSeat,
-      "seat " & $failedSeat & " decision failed: " & detail)
+        client.nativeAttempts[seat][0].rejectionReason = some(error.msg)
+      raise newDecisionFailure(seat, error.msg, providerFailure)

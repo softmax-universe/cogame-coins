@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-def make_provider(fail_beat=None):
+def make_provider(fail_beat=None, unavailable=False):
     calls = []
 
     class Provider(BaseHTTPRequestHandler):
@@ -33,14 +33,16 @@ def make_provider(fail_beat=None):
             calls.append((beat, int(slot)))
             assert "PRIVATE_OPERATOR_" + slot in user
             assert "PRIVATE_OPERATOR_" + str(1 - int(slot)) not in user
-            retry = "Your previous reply was invalid" in user
-            if (fail_beat is not None and beat == fail_beat) or (beat == 1 and not retry):
+            if unavailable:
+                self.send_error(503)
+                return
+            if fail_beat is not None and beat == fail_beat:
                 text = "invalid fixture reply"
             else:
                 action = {"intent": "take_mine", "say": "", "notes": "PRIVATE_CAPTURE_" + slot}
                 if beat == 2:
                     action["intent"] = "guard"
-                    text = "```json\n" + json.dumps(action) + "\n```"
+                    text = "My move:\n```json\n" + json.dumps(action) + "\n```"
                 else:
                     if beat == 3:
                         action.update(notes="x" * 900, say="s" * 100)
@@ -71,6 +73,7 @@ def run(
     capture,
     model_enabled=True,
     fail_beat=None,
+    unavailable=False,
     seat1_scripted=None,
     label="",
 ):
@@ -117,7 +120,7 @@ def run(
     )
     if not capture:
         env.pop("COGAME_SAVE_TRAJECTORY_URI")
-    provider_cls, calls = make_provider(fail_beat=fail_beat)
+    provider_cls, calls = make_provider(fail_beat=fail_beat, unavailable=unavailable)
     provider = ThreadingHTTPServer(("127.0.0.1", 0), provider_cls)
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
@@ -151,42 +154,44 @@ def run(
                 player_env["PLAYER_PROMPT"] = f"PRIVATE_OPERATOR_{seat}"
             player_env["COWORLD_PLAYER_WS_URL"] = f"ws://127.0.0.1:{port}/player?slot={seat}&token=fixture-{seat}"
             children.append(subprocess.Popen([str(player)], env=player_env, stdout=log, stderr=subprocess.STDOUT))
-        assert server.wait(timeout=120) == 0
-        for child in children[1:]:
-            assert child.wait(timeout=5) == 0
-        results = json.loads((root / "results.json").read_text())
-        replay = json.loads((root / "replay.json").read_text())
+        expect_failure = not model_enabled or unavailable or fail_beat is not None
+        assert server.wait(timeout=120) == int(expect_failure)
+        results_path = root / "results.json"
         failure_path = root / "player_failure.json"
-
-        expect_failure = (not model_enabled) or (fail_beat is not None)
         if expect_failure:
-            assert failure_path.exists(), "expected explicit player failure"
+            assert not results_path.exists()
             failure = json.loads(failure_path.read_text())
             assert failure["failed_policy_index"] == 0
-            assert results["reason"] == "forfeit"
+            assert failure.get("kind", "player_error") == ("player_error" if fail_beat else "episode_inconclusive")
             if capture:
                 trace = root / "trajectory.jsonl"
                 rows = [json.loads(line) for line in trace.read_text().splitlines()]
                 assert trace.stat().st_mode & 0o077 == 0
                 assert rows[-1]["status"] == "failed"
-                assert rows[-1]["outcome"] == results
+                assert rows[-1]["outcome"] == failure
                 failed_row = rows[-2]
                 assert failed_row["action_status"] == "rejected"
                 assert failed_row["selected_attempt_id"] is None
                 assert failed_row["executed_action"] is None
                 assert failed_row["terminal"] is True
-                if not model_enabled:
+                if unavailable:
+                    assert len(calls) == seats and len(failed_row["attempts"]) == 1
+                    assert "503" in failure["message"]
+                elif not model_enabled:
                     assert len(failed_row["attempts"]) == 1
                     assert failed_row["attempts"][0]["rejection_reason"] is not None
                 else:
-                    assert len(failed_row["attempts"]) == 2
+                    assert calls.count((fail_beat, 0)) == 1
+                    assert len(failed_row["attempts"]) == 1
                     for attempt in failed_row["attempts"]:
                         assert not attempt["accepted"]
                         assert "invalid fixture reply" in attempt["raw_response"]
-            for event in replay["events"]:
-                event.pop("latencyMs", None)
-            return results, replay
+            return failure
 
+        for child in children[1:]:
+            assert child.wait(timeout=5) == 0
+        results = json.loads(results_path.read_text())
+        replay = json.loads((root / "replay.json").read_text())
         assert not failure_path.exists(), f"unexpected failure: {failure_path.read_text()}"
         assert results["reason"] in ("random_end", "beat_cap")
         assert config["minBeats"] <= results["beats"] <= config["maxBeats"]
@@ -200,7 +205,7 @@ def run(
             seat1_orders = [e for e in orders if e["seat"] == 1]
             assert len(seat0_orders) == results["beats"]
             assert len(seat1_orders) == results["beats"]
-            assert seat0_orders[0]["source"] == "retry"
+            assert all(order["source"] == "llm" for order in seat0_orders)
             assert seat0_orders[1]["intent"] == "guard" and seat0_orders[1]["source"] == "llm"
             assert all(e["source"] == "scripted" for e in seat1_orders)
         elif capture:
@@ -213,20 +218,14 @@ def run(
             for row in rows[:-1]:
                 beat = row["observation"]["beat"]
                 attempts = row["attempts"]
-                if beat == 1:
-                    assert len(attempts) == 2 and not attempts[0]["accepted"]
-                    assert attempts[1]["accepted"]
-                    assert row["selected_attempt_id"] == attempts[1]["attempt_id"]
-                elif beat == 2:
-                    assert row["action_status"] == "accepted"
+                assert row["action_status"] == "accepted"
+                assert len(attempts) == 1 and attempts[0]["accepted"]
+                assert row["selected_attempt_id"] == attempts[0]["attempt_id"]
+                if beat == 2:
                     assert row["executed_action"]["intent"] == "guard"
-                elif beat == 3:
-                    assert row["action_status"] == "rejected"
-                    assert row["selected_attempt_id"] is None
+                if beat == 3:
                     assert len(row["executed_action"]["notes"]) == 300
                     assert len(row["executed_action"]["say"]) == 48
-                else:
-                    assert row["action_status"] == "accepted"
                 if beat == 4:
                     assert attempts[0]["input_tokens"] is None
                     assert attempts[0]["output_tokens"] is None
@@ -282,8 +281,10 @@ def main():
         manifest["variants"][0],
         True,
         fail_beat=2,
-        label="exhausted-invalid-reply-fails",
+        label="invalid-reply-fails",
     )
+    run(game, player, destination, manifest["variants"][0], True,
+        unavailable=True, label="provider-unavailable")
     captured = run(
         game,
         player,
@@ -305,7 +306,7 @@ def main():
     assert captured == ordinary, "capture changed the offline failure outcome or replay"
     print(
         "native games passed: physical replay parity, model-vs-baseline HTTP execution, "
-        "outer Markdown JSON fence, retries, normalization, explicit failure on invalid replies "
+        "one marked JSON action, normalization, explicit failure on invalid replies "
         "and missing credentials"
     )
 
